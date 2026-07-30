@@ -20,8 +20,10 @@ app.use(cors({
 
 // import the routes
 import healthCheckRouter from "./routes/healthcheck.routes.js"
+import reservationRouter from "./routes/reservation.routes.js"
 
 app.use("/api/v1/healthcheck", healthCheckRouter)
+app.use("/api", reservationRouter)
 
 // Root route
 app.get("/", (req, res) => {
