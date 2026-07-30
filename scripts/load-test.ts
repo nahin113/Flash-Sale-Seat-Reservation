@@ -48,11 +48,18 @@ async function runLoadTest() {
   console.log(`Other/Failures: ${otherCount}`);
 
   console.log(`\nChecking final status from server...`);
-  const statusResponse = await fetch(`${BASE_URL}/status`);
-  const statusData = await statusResponse.json();
 
-  if (!statusResponse.ok) {
-    console.error("Failed to fetch server status.", statusData);
+  let statusData: any;
+  try {
+    const statusResponse = await fetch(`${BASE_URL}/status`);
+    statusData = await statusResponse.json();
+
+    if (!statusResponse.ok) {
+      console.error("Failed to fetch server status.", statusData);
+      process.exit(1);
+    }
+  } catch (err: any) {
+    console.error(`\nFAIL: Could not reach /api/status — is the server still running? (${err.cause?.code ?? err.message})`);
     process.exit(1);
   }
 

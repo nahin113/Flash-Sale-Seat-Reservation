@@ -32,64 +32,83 @@ export const reserveSeat = asyncHandler(async (req: Request, res: Response) => {
   }
 
   const normalizedEmail = email.toLowerCase().trim();
+  const session = await mongoose.startSession();
 
-  // ── 1. Idempotency check (no transaction needed — just a read) ──────────────
-  const existing = await Reservation.findOne({ email: normalizedEmail });
-
-  if (existing) {
-    if (existing.status === "CONFIRMED") {
-      throw new APIError(400, "Email already has a confirmed seat");
-    }
-    if (existing.status === "HELD" && existing.expiresAt > new Date()) {
-      return res.status(200).json(
-        new ApiResponse(200, { holdId: existing.holdId, expiresAt: existing.expiresAt })
-      );
-    }
-    // Expired hold: remove it so the email can try again
-    await Reservation.deleteOne({ _id: existing._id });
-  }
-
-  // ── 2. Atomically claim a seat slot via conditional $inc ────────────────────
-  // Only increment if occupied < TOTAL_SEATS.
-  const counter = await SeatCounter.findOneAndUpdate(
-    { name: "global", occupied: { $lt: TOTAL_SEATS } },
-    { $inc: { occupied: 1 } },
-    { upsert: false, new: true }
-  );
-
-  if (!counter) {
-    // Either the document didn't exist yet OR occupied >= 30 — treat both as sold out.
-    // Ensure the document exists for future requests.
-    await SeatCounter.findOneAndUpdate(
-      { name: "global" },
-      { $setOnInsert: { occupied: 0 } },
-      { upsert: true }
-    );
-    throw new APIError(400, "Sold out");
-  }
-
-  // ── 3. Create the hold document ─────────────────────────────────────────────
-  const holdId = crypto.randomUUID();
-  const expiresAt = new Date(Date.now() + 2 * 60 * 1000); // 2 minutes
+  const lockSchema = new mongoose.Schema({ name: { type: String, unique: true }, version: { type: Number, default: 0 } });
+  const SeatLock = mongoose.models.SeatLock || mongoose.model("SeatLock", lockSchema);
 
   try {
-    const newReservation = await Reservation.create({
-      email: normalizedEmail,
-      status: "HELD",
-      holdId,
-      expiresAt,
+    let statusCode = 201;
+    let responseData: any = null;
+
+    await session.withTransaction(async () => {
+      // 1. Lazy reconciliation: Update expired holds atomically
+      await Reservation.updateMany(
+        { status: "HELD", expiresAt: { $lte: new Date() } },
+        { $set: { status: "EXPIRED" } },
+        { session }
+      );
+
+      // 2. Global serialization lock to prevent parallel check-then-act race conditions
+      await SeatLock.findOneAndUpdate(
+        { name: "global_reservation" },
+        { $inc: { version: 1 } },
+        { upsert: true, returnDocument: "after", session }
+      );
+
+      // 3. Idempotency Check
+      const existing = await Reservation.findOne({ email: normalizedEmail }).session(session);
+
+      if (existing) {
+        if (existing.status === "CONFIRMED") {
+          throw new APIError(400, "Email already has a confirmed seat");
+        }
+        if (existing.status === "HELD" && existing.expiresAt > new Date()) {
+          statusCode = 200;
+          responseData = { holdId: existing.holdId, expiresAt: existing.expiresAt };
+          return;
+        }
+        // If expired, delete it so the email can try again
+        await Reservation.deleteOne({ _id: existing._id }).session(session);
+      }
+
+      // 4. Calculate occupied seats dynamically using ONLY active holds and confirmed seats
+      const occupiedCount = await Reservation.countDocuments({
+        $or: [
+          { status: "CONFIRMED" },
+          { status: "HELD", expiresAt: { $gt: new Date() } }
+        ]
+      }).session(session);
+
+      if (occupiedCount >= TOTAL_SEATS) {
+        throw new APIError(400, "Sold out");
+      }
+
+      // 5. Create new hold
+      const holdId = crypto.randomUUID();
+      const expiresAt = new Date(Date.now() + 2 * 60 * 1000); // 2 minutes from now
+
+      const newReservation = await Reservation.create(
+        [
+          {
+            email: normalizedEmail,
+            status: "HELD",
+            holdId,
+            expiresAt,
+          },
+        ],
+        { session }
+      );
+
+      statusCode = 201;
+      responseData = { holdId: newReservation[0].holdId, expiresAt: newReservation[0].expiresAt };
     });
 
-    return res.status(201).json(
-      new ApiResponse(201, { holdId: newReservation.holdId, expiresAt: newReservation.expiresAt })
-    );
-  } catch (err) {
-    // If the Reservation.create fails, release the slot we just claimed
-    await SeatCounter.findOneAndUpdate(
-      { name: "global" },
-      { $inc: { occupied: -1 } }
-    );
-    throw err;
+    return res.status(statusCode).json(new ApiResponse(statusCode, responseData));
+  } catch (error) {
+    throw error;
+  } finally {
+    await session.endSession();
   }
 });
 
