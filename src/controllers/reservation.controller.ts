@@ -21,81 +21,81 @@ export const reserveSeat = asyncHandler(async (req: Request, res: Response) => {
 
   const normalizedEmail = email.toLowerCase().trim();
 
-  // We need a session to guarantee concurrency lock
+  // Define a simple lock schema/model on the fly to force a write-lock during transactions
+  const lockSchema = new mongoose.Schema({ name: { type: String, unique: true }, version: { type: Number, default: 0 } });
+  const SeatLock = mongoose.models.SeatLock || mongoose.model("SeatLock", lockSchema);
+
   const session = await mongoose.startSession();
-  session.startTransaction();
 
   try {
-    // 1. Idempotency Check
-    const existing = await Reservation.findOne({ email: normalizedEmail }).session(session);
+    let statusCode = 201;
+    let responseData: any = null;
 
-    if (existing) {
-      if (existing.status === "CONFIRMED") {
-        await session.abortTransaction();
-        session.endSession();
-        throw new APIError(400, "Email already has a confirmed seat");
+    await session.withTransaction(async () => {
+      // 0. Acquire a global document lock to force serialization of concurrent transactions
+      await SeatLock.findOneAndUpdate(
+        { name: "global_reservation" },
+        { $inc: { version: 1 } },
+        { upsert: true, new: true, session }
+      );
+
+      // 1. Idempotency Check
+      const existing = await Reservation.findOne({ email: normalizedEmail }).session(session);
+
+      if (existing) {
+        if (existing.status === "CONFIRMED") {
+          throw new APIError(400, "Email already has a confirmed seat");
+        }
+        if (existing.status === "HELD" && existing.expiresAt > new Date()) {
+          // Active hold exists, return idempotent response
+          statusCode = 200;
+          responseData = { holdId: existing.holdId, expiresAt: existing.expiresAt };
+          return;
+        }
+        
+        // If it's expired, delete it
+        if (existing.status === "EXPIRED" || (existing.status === "HELD" && existing.expiresAt <= new Date())) {
+           await Reservation.deleteOne({ _id: existing._id }).session(session);
+        }
       }
-      if (existing.status === "HELD" && existing.expiresAt > new Date()) {
-        // Active hold exists, return idempotent response
-        await session.abortTransaction();
-        session.endSession();
-        return res.status(200).json(
-          new ApiResponse(200, {
-            holdId: existing.holdId,
-            expiresAt: existing.expiresAt,
-          })
-        );
+
+      // 2. Concurrency Lock & Total Limit
+      const activeCount = await Reservation.countDocuments({
+        $or: [
+          { status: "CONFIRMED" },
+          { status: "HELD", expiresAt: { $gt: new Date() } },
+        ],
+      }).session(session);
+
+      if (activeCount >= 30) {
+        throw new APIError(400, "Sold out");
       }
-      
-      // If it's expired HELD or EXPIRED, we delete it to keep DB clean for this email
-      if (existing.status === "EXPIRED" || (existing.status === "HELD" && existing.expiresAt <= new Date())) {
-         await Reservation.deleteOne({ _id: existing._id }).session(session);
-      }
-    }
 
-    // 2. Concurrency Lock & Total Limit
-    const activeCount = await Reservation.countDocuments({
-      $or: [
-        { status: "CONFIRMED" },
-        { status: "HELD", expiresAt: { $gt: new Date() } },
-      ],
-    }).session(session);
+      // 3. Create new hold
+      const holdId = crypto.randomUUID();
+      const expiresAt = new Date(Date.now() + 2 * 60 * 1000); // 2 minutes from now
 
-    if (activeCount >= 30) {
-      await session.abortTransaction();
-      session.endSession();
-      throw new APIError(400, "Sold out");
-    }
+      const newReservation = await Reservation.create(
+        [
+          {
+            email: normalizedEmail,
+            status: "HELD",
+            holdId,
+            expiresAt,
+          },
+        ],
+        { session }
+      );
 
-    // 3. Create new hold
-    const holdId = crypto.randomUUID();
-    const expiresAt = new Date(Date.now() + 2 * 60 * 1000); // 2 minutes from now
+      statusCode = 201;
+      responseData = { holdId: newReservation[0].holdId, expiresAt: newReservation[0].expiresAt };
+    });
 
-    const newReservation = await Reservation.create(
-      [
-        {
-          email: normalizedEmail,
-          status: "HELD",
-          holdId,
-          expiresAt,
-        },
-      ],
-      { session }
-    );
-
-    await session.commitTransaction();
-    session.endSession();
-
-    return res.status(201).json(
-      new ApiResponse(201, {
-        holdId: newReservation[0].holdId,
-        expiresAt: newReservation[0].expiresAt,
-      })
-    );
+    return res.status(statusCode).json(new ApiResponse(statusCode, responseData));
   } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
     throw error;
+  } finally {
+    await session.endSession();
   }
 });
 
